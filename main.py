@@ -1,24 +1,31 @@
 import os
-import re
 import requests
 import base64
 import json
 import urllib.parse
 import time
+import yaml # 需要 import yaml 处理 clash 格式
 
 # ================= 配置 =================
 GITHUB_TOKEN = os.environ.get("MY_GIT_TOKEN") 
 GITHUB_REPO = os.environ.get("MY_REPO")
 GITHUB_FILE_PATH = "sub.txt"
-TARGET_URL = "https://v2raya.net/free-nodes/free-v2ray-node-subscriptions.html"
+
+# 这里列出多个高质量的公开订阅源 (Direct Sources)
+# 混合了 v2ray 格式和 clash 格式的源，脚本会自动处理
+SUBSCRIPTION_SOURCES = [
+    "https://raw.githubusercontent.com/freefq/free/master/v2",
+    "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
+    "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
+    "https://raw.githubusercontent.com/pawdroid/Free-servers/main/sub",
+    "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
+]
 # =======================================
 
-class V2RayProxyScraper:
+class NodeAggregator:
     def __init__(self):
         self.final_node_list = []
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+        self.headers = {"User-Agent": "Mozilla/5.0"}
 
     def log(self, message):
         print(f"[{time.strftime('%H:%M:%S')}] {message}")
@@ -26,6 +33,7 @@ class V2RayProxyScraper:
     def safe_base64_decode(self, s):
         if not s: return ""
         s = s.strip()
+        # 补全 padding
         missing_padding = 4 - len(s) % 4
         if missing_padding: s += '=' * missing_padding
         try:
@@ -34,6 +42,7 @@ class V2RayProxyScraper:
             return ""
 
     def get_node_name(self, link):
+        """尝试从链接中提取备注名称"""
         name = ""
         try:
             if link.startswith("vmess://"):
@@ -50,116 +59,81 @@ class V2RayProxyScraper:
         return name
 
     def is_target_country(self, name):
+        """筛选国家"""
         keywords = ["美国", "United States", " US ", "(US)", "[US]", "🇺🇸", 
-                    "英国", "United Kingdom", " UK ", "(UK)", "[UK]", "🇬🇧"]
-        if not name: return False
+                    "英国", "United Kingdom", " UK ", "(UK)", "[UK]", "🇬🇧",
+                    "日本", "Japan", "🇯🇵", "新加坡", "Singapore", "🇸🇬",
+                    "韩国", "Korea", "🇰🇷", "德国", "Germany", "🇩🇪"]
+        if not name: return False # 如果没名字，先保留或丢弃？这里选择丢弃，为了质量
         for kw in keywords:
             if kw.lower() in name.lower():
                 return True
         return False
 
-    def fetch_via_proxy(self, target_url):
-        """尝试通过多个中间人服务获取内容"""
-        # 方案1: Jina AI (通常最稳，把网页转为 Markdown)
-        proxy_jina = f"https://r.jina.ai/{target_url}"
-        # 方案2: CorsProxy (直接透传)
-        proxy_cors = f"https://corsproxy.io/?{target_url}"
+    def fetch_and_parse(self):
+        self.log(f"🚀 开始聚合 {len(SUBSCRIPTION_SOURCES)} 个订阅源...")
         
-        proxies = [
-            ("Jina AI", proxy_jina),
-            ("CorsProxy", proxy_cors)
-        ]
-
-        for p_name, p_url in proxies:
-            self.log(f"🔄 尝试通过 [{p_name}] 中转访问...")
+        for url in SUBSCRIPTION_SOURCES:
+            self.log(f"🌐 正在抓取: {url} ...")
             try:
-                # Jina 需要特殊的 header 确保不缓存太久
-                headers = self.headers.copy()
-                if "jina.ai" in p_url:
-                    headers["X-No-Cache"] = "true"
-                    headers["X-With-Links-Summary"] = "true"
-
-                resp = requests.get(p_url, headers=headers, timeout=20)
-                if resp.status_code == 200 and len(resp.text) > 100:
-                    self.log(f"✅ [{p_name}] 访问成功！")
-                    return resp.text
-                else:
-                    self.log(f"⚠️ [{p_name}] 返回状态码 {resp.status_code} 或内容过短")
-            except Exception as e:
-                self.log(f"❌ [{p_name}] 连接错误: {str(e)[:50]}...")
-        
-        return None
-
-    def run_scraping(self):
-        self.log(f"🚀 开始任务，目标: {TARGET_URL}")
-        
-        # 1. 获取主页源码 (通过中间人)
-        page_text = self.fetch_via_proxy(TARGET_URL)
-        if not page_text:
-            self.log("❌ 所有中间人代理均失败，无法获取主页。")
-            return None
-
-        # 2. 提取 sub 链接
-        # 兼容 HTML 和 Markdown 格式的链接提取
-        # 匹配 https://fn10... 直到遇到空格、引号或括号
-        pattern = re.compile(r"(https://fn10[a-zA-Z0-9\.\/\-_]+)")
-        sub_links = list(set(pattern.findall(page_text)))
-
-        if not sub_links:
-            self.log(f"❌ 未在页面中找到 fn10 开头的链接。")
-            self.log(f"调试 - 页面前200字符: {page_text[:200]}")
-            return None
-
-        self.log(f"✅ 提取到 {len(sub_links)} 个订阅源链接，准备解析...")
-
-        # 3. 遍历子链接获取节点
-        for sub_url in sub_links:
-            # 清理一下链接可能粘连的标点符号
-            sub_url = sub_url.rstrip(').,]"')
-            
-            self.log(f"🌐 正在请求子链接: {sub_url} ...")
-            
-            # 同样使用中间人去下载子链接，防止直接请求被封
-            content = self.fetch_via_proxy(sub_url)
-            
-            if content:
-                # 尝试解码，有时候中间人会把内容包装在 JSON 里，或者直接返回文本
-                # 先简单清洗
-                if "Proxy" in content and "Error" in content:
+                resp = requests.get(url, headers=self.headers, timeout=15)
+                if resp.status_code != 200:
+                    self.log(f"   ⚠️ 失败: HTTP {resp.status_code}")
                     continue
-
-                decoded = self.safe_base64_decode(content)
-                # 如果解码失败，且内容里包含 vmess://，说明已经是明文
-                if not decoded and "vmess://" in content:
-                    decoded = content
                 
+                content = resp.text.strip()
+                nodes_found = 0
+                
+                # 尝试解码 Base64 (V2Ray 标准格式)
+                decoded = self.safe_base64_decode(content)
+                
+                # 如果解码失败，可能它是原文，或者是 Clash 格式
+                raw_lines = []
                 if decoded:
-                    lines = decoded.splitlines()
-                    count = 0
-                    for node in lines:
-                        node = node.strip()
-                        if not node: continue
-                        if self.is_target_country(self.get_node_name(node)):
-                            self.final_node_list.append(node)
-                            count += 1
-                    self.log(f"   -> 成功提取 {count} 个节点")
+                    raw_lines = decoded.splitlines()
                 else:
-                    self.log("   -> 解析失败：Base64解码无效且非明文")
+                    # 尝试直接按行读取（有些源直接返回 vmess://...）
+                    raw_lines = content.splitlines()
+
+                # 遍历每一行进行解析
+                for line in raw_lines:
+                    line = line.strip()
+                    if not line: continue
+                    
+                    # 只处理 vmess/vless/trojan/ss 链接
+                    if line.startswith(("vmess://", "vless://", "trojan://", "ss://")):
+                        # 筛选国家
+                        name = self.get_node_name(line)
+                        if self.is_target_country(name):
+                            self.final_node_list.append(line)
+                            nodes_found += 1
+                
+                self.log(f"   ✅ 获取到 {nodes_found} 个有效节点")
+
+            except Exception as e:
+                self.log(f"   ❌ 出错: {e}")
 
         # 去重
+        original_count = len(self.final_node_list)
         self.final_node_list = list(set(self.final_node_list))
-        self.log(f"🎉 最终获取 {len(self.final_node_list)} 个节点")
+        self.log(f"\n🎉 聚合完成！")
+        self.log(f"   原始数量: {original_count}")
+        self.log(f"   去重后数量: {len(self.final_node_list)}")
         
         return "\n".join(self.final_node_list) if self.final_node_list else None
 
     def upload_to_github(self, content):
         if not GITHUB_TOKEN or not GITHUB_REPO:
-            self.log("❌ Token/Repo 未配置")
+            self.log("❌ 错误: 环境变量未配置 (Token/Repo)")
             return
 
         api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
-        headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
 
+        # 检查文件是否存在以获取 sha
         sha = None
         try:
             resp = requests.get(api_url, headers=headers)
@@ -167,26 +141,35 @@ class V2RayProxyScraper:
                 sha = resp.json().get("sha")
         except: pass
 
-        # 再次 base64 编码以便 V2RayN 识别
-        final_b64 = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+        # 构造 Base64 内容
+        # 注意：这里我们上传的是"Base64编码后的订阅内容"，因为订阅链接本身就是Base64格式的
+        # 为了让 V2RayN 识别，通常还是再次 Base64 编码一下比较稳妥
+        final_content_b64 = base64.b64encode(content.encode("utf-8")).decode("utf-8")
         
-        api_data = {
-            "message": f"Update via Proxy {time.strftime('%Y-%m-%d')}",
-            "content": base64.b64encode(final_b64.encode("utf-8")).decode("utf-8"),
+        # GitHub API 需要 Payload 也是 Base64
+        upload_data_b64 = base64.b64encode(final_content_b64.encode("utf-8")).decode("utf-8")
+
+        data = {
+            "message": f"Auto update nodes {time.strftime('%Y-%m-%d %H:%M')}",
+            "content": upload_data_b64, 
             "branch": "main"
         }
-        if sha: api_data["sha"] = sha
+        if sha: data["sha"] = sha
 
-        resp = requests.put(api_url, headers=headers, data=json.dumps(api_data))
-        if resp.status_code in [200, 201]:
-            self.log("✅ GitHub 更新成功！")
-        else:
-            self.log(f"❌ 上传失败: {resp.text}")
+        try:
+            put_resp = requests.put(api_url, headers=headers, data=json.dumps(data))
+            if put_resp.status_code in [200, 201]:
+                self.log("✅ GitHub 仓库更新成功！")
+            else:
+                self.log(f"❌ 上传失败: {put_resp.status_code} - {put_resp.text}")
+        except Exception as e:
+            self.log(f"❌ 网络请求异常: {e}")
 
 if __name__ == "__main__":
-    app = V2RayProxyScraper()
-    nodes = app.run_scraping()
+    aggregator = NodeAggregator()
+    nodes = aggregator.fetch_and_parse()
+    
     if nodes:
-        app.upload_to_github(nodes)
+        aggregator.upload_to_github(nodes)
     else:
-        print("⚠️ 未获取到节点，跳过上传。")
+        print("⚠️ 未找到任何有效节点，跳过上传。")
