@@ -1,31 +1,24 @@
 import os
-import requests
+import re
 import base64
 import json
 import urllib.parse
 import time
-import yaml # 需要 import yaml 处理 clash 格式
+from curl_cffi import requests # 引入伪装库
 
 # ================= 配置 =================
 GITHUB_TOKEN = os.environ.get("MY_GIT_TOKEN") 
 GITHUB_REPO = os.environ.get("MY_REPO")
 GITHUB_FILE_PATH = "sub.txt"
-
-# 这里列出多个高质量的公开订阅源 (Direct Sources)
-# 混合了 v2ray 格式和 clash 格式的源，脚本会自动处理
-SUBSCRIPTION_SOURCES = [
-    "https://raw.githubusercontent.com/freefq/free/master/v2",
-    "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
-    "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
-    "https://raw.githubusercontent.com/pawdroid/Free-servers/main/sub",
-    "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
-]
+# 你的目标地址
+TARGET_URL = "https://v2raya.net/free-nodes/free-v2ray-node-subscriptions.html"
 # =======================================
 
-class NodeAggregator:
+class V2RayScraperStealth:
     def __init__(self):
         self.final_node_list = []
-        self.headers = {"User-Agent": "Mozilla/5.0"}
+        # 使用 curl_cffi 的 Session，模拟 Chrome 110
+        self.session = requests.Session()
 
     def log(self, message):
         print(f"[{time.strftime('%H:%M:%S')}] {message}")
@@ -33,7 +26,6 @@ class NodeAggregator:
     def safe_base64_decode(self, s):
         if not s: return ""
         s = s.strip()
-        # 补全 padding
         missing_padding = 4 - len(s) % 4
         if missing_padding: s += '=' * missing_padding
         try:
@@ -42,7 +34,6 @@ class NodeAggregator:
             return ""
 
     def get_node_name(self, link):
-        """尝试从链接中提取备注名称"""
         name = ""
         try:
             if link.startswith("vmess://"):
@@ -59,117 +50,107 @@ class NodeAggregator:
         return name
 
     def is_target_country(self, name):
-        """筛选国家"""
         keywords = ["美国", "United States", " US ", "(US)", "[US]", "🇺🇸", 
-                    "英国", "United Kingdom", " UK ", "(UK)", "[UK]", "🇬🇧",
-                    "日本", "Japan", "🇯🇵", "新加坡", "Singapore", "🇸🇬",
-                    "韩国", "Korea", "🇰🇷", "德国", "Germany", "🇩🇪"]
-        if not name: return False # 如果没名字，先保留或丢弃？这里选择丢弃，为了质量
+                    "英国", "United Kingdom", " UK ", "(UK)", "[UK]", "🇬🇧"]
+        if not name: return False
         for kw in keywords:
             if kw.lower() in name.lower():
                 return True
         return False
 
-    def fetch_and_parse(self):
-        self.log(f"🚀 开始聚合 {len(SUBSCRIPTION_SOURCES)} 个订阅源...")
+    def fetch_url_content(self, url):
+        """使用伪装指纹下载内容"""
+        try:
+            # impersonate="chrome110" 是核心，它模拟了真实浏览器的握手
+            response = self.session.get(url, impersonate="chrome110", timeout=30)
+            if response.status_code == 200:
+                return response.text
+            else:
+                self.log(f"⚠️ 访问失败 [{response.status_code}]: {url}")
+                return None
+        except Exception as e:
+            self.log(f"❌ 请求异常: {e}")
+            return None
+
+    def run_scraping(self):
+        self.log(f"🚀 开始隐身访问: {TARGET_URL}")
         
-        for url in SUBSCRIPTION_SOURCES:
-            self.log(f"🌐 正在抓取: {url} ...")
-            try:
-                resp = requests.get(url, headers=self.headers, timeout=15)
-                if resp.status_code != 200:
-                    self.log(f"   ⚠️ 失败: HTTP {resp.status_code}")
-                    continue
-                
-                content = resp.text.strip()
-                nodes_found = 0
-                
-                # 尝试解码 Base64 (V2Ray 标准格式)
-                decoded = self.safe_base64_decode(content)
-                
-                # 如果解码失败，可能它是原文，或者是 Clash 格式
-                raw_lines = []
-                if decoded:
-                    raw_lines = decoded.splitlines()
-                else:
-                    # 尝试直接按行读取（有些源直接返回 vmess://...）
-                    raw_lines = content.splitlines()
+        # 1. 获取主页源码
+        page_text = self.fetch_url_content(TARGET_URL)
+        if not page_text:
+            return None
 
-                # 遍历每一行进行解析
-                for line in raw_lines:
-                    line = line.strip()
-                    if not line: continue
-                    
-                    # 只处理 vmess/vless/trojan/ss 链接
-                    if line.startswith(("vmess://", "vless://", "trojan://", "ss://")):
-                        # 筛选国家
-                        name = self.get_node_name(line)
-                        if self.is_target_country(name):
-                            self.final_node_list.append(line)
-                            nodes_found += 1
-                
-                self.log(f"   ✅ 获取到 {nodes_found} 个有效节点")
+        # 2. 提取 sub 链接 (正则匹配 fn10 开头的链接)
+        pattern = re.compile(r"https://fn10[^\s\"'<]+")
+        sub_links = list(set(pattern.findall(page_text)))
 
-            except Exception as e:
-                self.log(f"   ❌ 出错: {e}")
+        if not sub_links:
+            self.log(f"❌ 未找到订阅子链接，可能是页面结构变更或反爬升级。")
+            # 调试：打印前500个字符看看是什么
+            self.log(f"页面预览: {page_text[:200]}")
+            return None
+
+        self.log(f"✅ 成功绕过防火墙，找到 {len(sub_links)} 个订阅源")
+
+        # 3. 遍历子链接获取节点
+        for sub_url in sub_links:
+            self.log(f"🌐 解析子链接: {sub_url} ...")
+            content = self.fetch_url_content(sub_url)
+            if content:
+                decoded = self.safe_base64_decode(content) or content
+                lines = decoded.splitlines()
+                count = 0
+                for node in lines:
+                    node = node.strip()
+                    if not node: continue
+                    if self.is_target_country(self.get_node_name(node)):
+                        self.final_node_list.append(node)
+                        count += 1
+                self.log(f"   -> 提取到 {count} 个目标节点")
 
         # 去重
-        original_count = len(self.final_node_list)
         self.final_node_list = list(set(self.final_node_list))
-        self.log(f"\n🎉 聚合完成！")
-        self.log(f"   原始数量: {original_count}")
-        self.log(f"   去重后数量: {len(self.final_node_list)}")
+        self.log(f"🎉 最终获取 {len(self.final_node_list)} 个节点")
         
         return "\n".join(self.final_node_list) if self.final_node_list else None
 
     def upload_to_github(self, content):
         if not GITHUB_TOKEN or not GITHUB_REPO:
-            self.log("❌ 错误: 环境变量未配置 (Token/Repo)")
+            self.log("❌ Token/Repo 未配置")
             return
 
         api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
-        headers = {
-            "Authorization": f"token {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github.v3+json"
-        }
+        headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
 
-        # 检查文件是否存在以获取 sha
         sha = None
         try:
-            resp = requests.get(api_url, headers=headers)
+            resp = requests.get(api_url, headers=headers) # 使用普通 requests 或 curl_cffi 都可以
             if resp.status_code == 200:
                 sha = resp.json().get("sha")
         except: pass
 
-        # 构造 Base64 内容
-        # 注意：这里我们上传的是"Base64编码后的订阅内容"，因为订阅链接本身就是Base64格式的
-        # 为了让 V2RayN 识别，通常还是再次 Base64 编码一下比较稳妥
-        final_content_b64 = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+        # 再次 base64 编码以便 V2RayN 识别
+        final_b64 = base64.b64encode(content.encode("utf-8")).decode("utf-8")
         
-        # GitHub API 需要 Payload 也是 Base64
-        upload_data_b64 = base64.b64encode(final_content_b64.encode("utf-8")).decode("utf-8")
-
-        data = {
-            "message": f"Auto update nodes {time.strftime('%Y-%m-%d %H:%M')}",
-            "content": upload_data_b64, 
+        # GitHub API payload
+        api_data = {
+            "message": f"Update from v2raya {time.strftime('%Y-%m-%d')}",
+            "content": base64.b64encode(final_b64.encode("utf-8")).decode("utf-8"),
             "branch": "main"
         }
-        if sha: data["sha"] = sha
+        if sha: api_data["sha"] = sha
 
-        try:
-            put_resp = requests.put(api_url, headers=headers, data=json.dumps(data))
-            if put_resp.status_code in [200, 201]:
-                self.log("✅ GitHub 仓库更新成功！")
-            else:
-                self.log(f"❌ 上传失败: {put_resp.status_code} - {put_resp.text}")
-        except Exception as e:
-            self.log(f"❌ 网络请求异常: {e}")
+        # 上传请求不用伪装，直接用 requests 即可 (这里复用 session)
+        resp = self.session.put(api_url, headers=headers, data=json.dumps(api_data))
+        if resp.status_code in [200, 201]:
+            self.log("✅ GitHub 更新成功！")
+        else:
+            self.log(f"❌ 上传失败: {resp.text}")
 
 if __name__ == "__main__":
-    aggregator = NodeAggregator()
-    nodes = aggregator.fetch_and_parse()
-    
+    app = V2RayScraperStealth()
+    nodes = app.run_scraping()
     if nodes:
-        aggregator.upload_to_github(nodes)
+        app.upload_to_github(nodes)
     else:
-        print("⚠️ 未找到任何有效节点，跳过上传。")
+        print("⚠️ 未获取到节点，跳过上传。")
